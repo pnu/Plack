@@ -5,6 +5,7 @@ use parent qw(Plack::Middleware);
 use Plack::MIME;
 use Plack::Util;
 use Plack::Util::Accessor qw( subrequest );
+use Data::Dumper;
 
 use HTTP::Status qw(is_error);
 
@@ -12,16 +13,20 @@ sub call {
     my $self = shift;
     my $env  = shift;
 
+    my $response;
+    warn 'doing r '.$env->{PATH_INFO};
     my $r = $self->app->($env);
-
-    $self->response_cb($r, sub {
+    my $process = sub {
         my $r = shift;
         unless (is_error($r->[0]) && exists $self->{$r->[0]}) {
+            warn 'not interested';
+            warn Dumper $r;
             return;
         }
-
+        
         my $path = $self->{$r->[0]};
         if ($self->subrequest) {
+            warn 'doing sub';
             for my $key (keys %$env) {
                 unless ($key =~ /^psgi/) {
                     $env->{'psgix.errordocument.' . $key} = $env->{$key};
@@ -35,10 +40,42 @@ sub call {
             $env->{QUERY_STRING}   = '';
             delete $env->{CONTENT_LENGTH};
 
+            warn 'doing sub_r '.$env->{PATH_INFO};
             my $sub_r = $self->app->($env);
-            if ($sub_r->[0] == 200) {
+
+            if ( ref($sub_r) eq 'CODE' ) {
+                warn 'sub_r is delayed';
+                $response = sub {
+                    my $r_starter = shift;
+                    warn 'r_starter:';
+                    warn Dumper $r_starter;
+                    my $r_writer;
+                    $sub_r->( sub {
+                        my $resp = shift;
+                        warn Dumper $resp;
+                        if ( $resp->[0] != 200 ) {
+                            warn 'ignoring sub_r';
+                            $r_writer = $r_starter->($r);
+                            return Plack::Util::inline_object(
+                                write => sub { }, close => sub { }
+                            );
+                        }
+                        # r writer -> sub_r writer
+                        return $r_starter->([$r->[0],$resp->[1]]);
+                    } );
+                    warn 'got back from sub_r';
+                    warn Dumper $r;
+                    return $r_writer;
+                };
+                return;
+            } else {
+                warn 'sub_r is immediate';
+                warn 'but r needs a writer' unless $r->[2];
+                return unless $sub_r->[0] == 200;
+                $response = sub {}; #Plack::Util::inline_object(write=>sub{},close=>sub{});
                 $r->[1] = $sub_r->[1];
                 $r->[2] = $sub_r->[2];
+                return sub {};
             }
             # TODO: allow 302 here?
         } else {
@@ -48,7 +85,23 @@ sub call {
             $h->remove('Content-Length');
             $h->set('Content-Type', Plack::MIME->mime_type($path));
         }
-    });
+        return;
+    };
+    
+    my $res;
+    if ( ref($r) eq 'CODE' ) {
+        warn 'got delayed response, have to return delayed response to the server';
+        return sub {
+            my $starter = shift; # call this to get writer for server
+            warn 'doo '.Dumper $starter;
+            return $r->( sub { $process->(@_) || $starter->(@_) } );
+        }
+    } else {
+        $res = $process->($r) || $r;
+    }
+    
+    warn 'after response_cb';
+    return $response || $res;
 }
 
 1;
